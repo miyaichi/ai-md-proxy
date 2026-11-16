@@ -1,0 +1,49 @@
+name: Deploy to Cloud Run
+
+on:
+  push:
+    branches: [main]
+    paths: ['src/**', 'package.json', 'package-lock.json', 'Dockerfile', '.github/workflows/deploy.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # Workload Identity Federation に必要
+
+env:
+  REGION: asia-northeast1
+  SERVICE: ai-md-proxy
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - name: テストHTMLで広告除去と変換を確認
+        run: |
+          node src/cli.js --file test/fixture.html --base https://news.example.jp/a > out.md
+          grep -q "観光列車の導入" out.md
+          ! grep -q "30%オフ" out.md
+          ! grep -q "アクセスランキング" out.md
+
+  deploy:
+    needs: test
+    if: vars.GCP_WIF_PROVIDER != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Deploy
+        # 公開/非公開の設定は初回デプロイ時のものを引き継ぐ
+        run: |
+          gcloud run deploy "$SERVICE" --source . \
+            --project "${{ vars.GCP_PROJECT_ID }}" --region "$REGION" \
+            --memory 1Gi --cpu 1 --concurrency 20 --timeout 60 \
+            --min-instances 0 --max-instances 3 --quiet
