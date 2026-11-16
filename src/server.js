@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { urlToMarkdown } from './extract.js';
 import { loadKeys, identify, makeRateLimiter } from './auth.js';
+import { pageOf } from './paginate.js';
 
 const PORT = Number(process.env.PORT || 8787);
 const cache = new Map(); // 簡易キャッシュ（URL → {at, body}）
@@ -46,7 +47,7 @@ const server = http.createServer(async (req, res) => {
     const log = (status, extra = {}) =>
       console.log(JSON.stringify({ severity: status >= 500 ? 'WARNING' : 'INFO', client, target, status, ms: Date.now() - t0, ...extra }));
 
-    const key = `${target}|${slots}`;
+    const key = `${pageOf(target)?.key || target}|${slots}`;
     const hit = cache.get(key);
     if (hit && Date.now() - hit.at < TTL_MS) {
       log(200, { cache: 'HIT' });
@@ -55,7 +56,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const { markdown, meta } = await urlToMarkdown(target, { adSlots: slots });
       cache.set(key, { at: Date.now(), body: markdown, canonical: meta.canonical });
-      log(200, { cache: 'MISS', removedAds: meta.adStats.total, mode: meta.mode });
+      log(200, { cache: 'MISS', removedAds: meta.adStats.total, mode: meta.mode, pages: meta.pages, truncated: meta.truncated });
       return send(res, 200, markdown, {
         ...mdHeaders(meta.canonical),
         'x-cache': 'MISS',

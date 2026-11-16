@@ -38,6 +38,20 @@ curl "http://localhost:8787/md?url=https://example.com/article&slots=3"
 4. **Markdown 変換**：Turndown＋GFM（表に対応）。トラッキングピクセルは削除し、YouTube/Vimeo の埋め込みはリンクに置き換えます。相対URLは絶対URLにします。
 5. **出力**：YAML フロントマター（title、source=canonical、site、byline、published、lang、excerpt、fetched_at、removed_ad_elements）＋本文。
 
+## 複数ページの記事
+
+`?page=2` のように複数ページに分かれた記事は、**どのページのURLで呼ばれても、全ページの本文を1つの Markdown に結合して返します**。
+
+- 1ページ目の `<link rel="next">` とページ送りのリンクから他ページを見つけ、並列に取得して順に結合（ページ送りが途中までしか表示されない場合は最後のページの「次へ」をたどる）
+- ページ番号として扱うのは `?page=N`（`p`、`pg` 等も可）、`/page/N/`、`xxx_N.html`、`xxx-N.html` だけ。記事IDの数字をページ番号と誤認しない
+- 2ページ目以降で繰り返されるタイトル・日付・写真は除き、境界に `<!-- page:N -->` を入れる
+- 正規URL（`Link` ヘッダーと `source`）は1ページ目。front matter に `pages: "N"`
+- 同じ記事・別ドメイン以外のページはたどらない。最大20ページ、全体40秒まで
+- **会員限定・有料の壁**（構造化データの `isAccessibleForFree: false`、「この記事の続きは会員限定」等の案内、401/402/403）を検出したら、そこで止めて `truncated: "true"` を付ける。ペイウォールを回避して取得することはしない
+- プロキシのキャッシュも記事単位（`?page=2` と `?page=3` は同じキャッシュ）
+
+テスト：`node test/paged.test.mjs`
+
 ## 広告枠マーカー（次の段階への接続点）
 
 `slots=N` を付けると、N段落ごとに `<!-- ad-slot:1 -->` が入ります。後段の処理でこのマーカーを実際の Markdown 広告に置き換える想定です。

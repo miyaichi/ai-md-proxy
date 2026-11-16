@@ -37,6 +37,8 @@ jobs:
           for w in メインコンテンツ RSS 通知ON 最新ニュース フィーチャー 写真ニュース ランキング すべての写真 次のページ 無断転載; do
             if grep -q "$w" portal.md; then echo "残ってはいけない文字列: $w"; exit 1; fi
           done
+      - name: 複数ページ記事の結合・会員限定での停止
+        run: node test/paged.test.mjs
 
   deploy:
     needs: test

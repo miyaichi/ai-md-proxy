@@ -5,6 +5,7 @@ import { gfm } from 'turndown-plugin-gfm';
 import dns from 'node:dns/promises';
 import net from 'node:net';
 import { removeAds } from './adfilter.js';
+import { paginationInfo, dropRepeatedHead, removePaywallNotices } from './paginate.js';
 import { findContentRoot, removeBoilerplate, contentParagraphs, textLen, cleanTitle } from './scope.js';
 
 const MAX_BYTES = 5 * 1024 * 1024; // 5MB
@@ -62,7 +63,7 @@ export async function fetchHtml(u) {
       redirect: 'follow',
       signal: ctrl.signal,
     });
-    if (!res.ok) throw new Error(`取得失敗: HTTP ${res.status}`);
+    if (!res.ok) throw Object.assign(new Error(`取得失敗: HTTP ${res.status}`), { status: res.status });
     const ct = res.headers.get('content-type') || '';
     if (!/html|xml/.test(ct)) throw new Error(`HTMLではありません: ${ct}`);
     // リダイレクト先も再チェック
@@ -113,19 +114,17 @@ function frontMatter(meta) {
 }
 
 /**
- * HTML → 広告除去 → 本文抽出 → Markdown
- * @param {string} html
- * @param {string} url ベースURL（相対リンクの絶対化に使用）
- * @param {{ adSlots?: number }} opts adSlots>0 なら N段落ごとに広告挿入用マーカーを入れる
+ * 1ページ分の HTML から本文とメタデータを取り出す
  */
-export function htmlToMarkdown(html, url, opts = {}) {
+export function extractPage(html, url) {
   const virtualConsole = new VirtualConsole(); // CSSパースエラー等のノイズを抑止
   const dom = new JSDOM(html, { url, virtualConsole }); // スクリプトは実行しない
   const doc = dom.window.document;
 
-  // canonical / meta は除去前に拾っておく
+  // canonical / meta / ページ送りは除去前に拾っておく
   const meta = (sel) => doc.querySelector(sel)?.getAttribute('content') || undefined;
   const canonical = pickCanonical(doc, url);
+  const pageInfo = paginationInfo(doc, url);
   const timeEl = doc.querySelector('article time, time[datetime]');
   const published =
     meta('meta[property="article:published_time"]') || meta('meta[name="pubdate"]') ||
@@ -133,8 +132,10 @@ export function htmlToMarkdown(html, url, opts = {}) {
   const lang = doc.documentElement.getAttribute('lang') || undefined;
   const ogTitle = meta('meta[property="og:title"]');
   const ogSite = meta('meta[property="og:site_name"]');
+  const description = meta('meta[name="description"]');
 
   const adStats = removeAds(doc);
+  removePaywallNotices(doc);
 
   // 1) 本文の範囲を特定し、その範囲だけで処理する
   let contentHtml;
@@ -170,25 +171,58 @@ export function htmlToMarkdown(html, url, opts = {}) {
   const norm = (s) => s.replace(/[\s　]/g, '');
   body = body.replace(/^#{1,3} (.+)\n+/, (m, h) => (title && norm(h) === norm(title) ? '' : m));
 
+  return {
+    url, canonical, pageInfo, title, site, byline: article?.byline, published, lang,
+    excerpt: article?.excerpt || description, body, adStats, mode,
+  };
+}
+
+/**
+ * 1ページ以上の抽出結果を1つの Markdown にまとめる
+ */
+function compose(pages, opts = {}, { truncated = false } = {}) {
+  const first = pages[0];
+  let body = first.body;
+  for (const p of pages.slice(1)) {
+    const rest = dropRepeatedHead(p.body, first.body, first.title);
+    if (rest) body += `\n\n<!-- page:${p.pageInfo.n} -->\n\n${rest}`;
+  }
   if (opts.adSlots > 0) body = insertAdSlotMarkers(body, opts.adSlots);
 
+  const removed = pages.reduce((s, p) => s + p.adStats.total, 0);
+  // 複数ページを結合したときは記事全体を表すので、正規URLは1ページ目（ページ指定なし）
+  const canonical = pages.length > 1 ? (first.pageInfo.n === 1 ? first.canonical : first.pageInfo.key) : first.canonical;
   const fm = frontMatter({
-    title,
+    title: first.title,
     source: canonical,
-    site,
-    byline: article?.byline,
-    published,
-    lang,
-    excerpt: article?.excerpt || meta('meta[name="description"]'),
+    site: first.site,
+    byline: first.byline,
+    published: first.published,
+    lang: first.lang,
+    excerpt: first.excerpt,
+    pages: pages.length > 1 ? pages.length : undefined,
+    truncated: truncated ? 'true' : undefined,
     fetched_at: new Date().toISOString(),
-    removed_ad_elements: adStats.total,
+    removed_ad_elements: removed,
   });
-
-  const heading = title ? `# ${title}\n\n` : '';
+  const heading = first.title ? `# ${first.title}\n\n` : '';
+  const note = truncated ? '\n\n> この記事の続きは元のページ（会員限定・有料部分を含む）でお読みください。\n' : '';
   return {
-    markdown: fm + heading + body + '\n',
-    meta: { title, canonical, adStats, mode, length: body.length },
+    markdown: fm + heading + body + note + '\n',
+    meta: {
+      title: first.title, canonical, mode: first.mode, pages: pages.length, truncated,
+      adStats: { total: removed }, length: body.length,
+    },
   };
+}
+
+/**
+ * HTML → 広告除去 → 本文抽出 → Markdown（1ページのみ。CLI の --file 用）
+ * @param {{ adSlots?: number }} opts adSlots>0 なら N段落ごとに広告挿入用マーカーを入れる
+ */
+export function htmlToMarkdown(html, url, opts = {}) {
+  const p = extractPage(html, url);
+  return compose([p], opts, { truncated: p.pageInfo.paywalled });
 }
 
 // 正規URLの決定: <link rel=canonical> → og:url → 取得URL
@@ -217,13 +251,65 @@ function insertAdSlotMarkers(md, every) {
   let slot = 0;
   for (const b of blocks) {
     out.push(b);
-    const isPara = b && !/^(#|\||-|\*|>|```|!\[|\d+\.)/.test(b.trim());
+    const isPara = b && !/^(#|\||-|\*|>|<|```|!\[|\d+\.)/.test(b.trim());
     if (isPara && ++paras % every === 0) out.push(`<!-- ad-slot:${++slot} -->`);
   }
   return out.join('\n\n');
 }
 
+const MAX_PAGES = 20;
+const DEADLINE_MS = 40000; // Cloud Run のタイムアウト(60秒)より十分短く
+
+/**
+ * URL → Markdown。複数ページの記事は全ページを結合して返す
+ * どのページのURLで呼ばれても、1ページ目から結合した同じ結果になる
+ * @param {{ adSlots?: number, fetcher?: (url:string)=>Promise<{html:string, finalUrl:string}> }} opts
+ */
 export async function urlToMarkdown(u, opts = {}) {
-  const { html, finalUrl } = await fetchHtml(u);
-  return htmlToMarkdown(html, finalUrl, opts);
+  const fetcher = opts.fetcher || fetchHtml;
+  const started = Date.now();
+  let r = await fetcher(u);
+  let first = extractPage(r.html, r.finalUrl);
+
+  // 2ページ目以降のURLで呼ばれたら1ページ目から取り直す
+  if (first.pageInfo.n > 1) {
+    r = await fetcher(first.pageInfo.pages.get(1));
+    first = extractPage(r.html, r.finalUrl);
+  }
+
+  const pages = [first];
+  let truncated = first.pageInfo.paywalled;
+  const seen = new Set([first.pageInfo.n]);
+
+  // 有料・会員限定のエラー（401/402/403）は「続きあり」として扱い、それ以外のエラーはそこで終了
+  const stopOn = (e) => { if ([401, 402, 403].includes(e?.status)) truncated = true; };
+  const add = (res) => {
+    const p = extractPage(res.html, res.finalUrl);
+    if (p.pageInfo.key !== first.pageInfo.key || seen.has(p.pageInfo.n)) return false; // 別記事へのリダイレクト等
+    seen.add(p.pageInfo.n);
+    pages.push(p);
+    if (p.pageInfo.paywalled) { truncated = true; return false; }
+    return true;
+  };
+
+  // (a) 1ページ目に載っているページ番号は並列に取得
+  if (!truncated) {
+    const known = [...first.pageInfo.pages.entries()]
+      .filter(([n]) => n > 1).sort((a, b) => a[0] - b[0]).slice(0, MAX_PAGES - 1);
+    const results = await Promise.allSettled(known.map(([, url]) => fetcher(url)));
+    for (const res of results) {
+      if (res.status === 'rejected') { stopOn(res.reason); break; }
+      if (!add(res.value)) break;
+    }
+  }
+  // (b) ページ送りが途中までしか表示されない場合に備え、最後のページの「次へ」をたどる
+  while (!truncated && pages.length < MAX_PAGES && Date.now() - started < DEADLINE_MS) {
+    const next = pages[pages.length - 1].pageInfo.next;
+    if (!next) break;
+    let res;
+    try { res = await fetcher(next); } catch (e) { stopOn(e); break; }
+    if (!add(res)) break;
+  }
+
+  return compose(pages, opts, { truncated });
 }
