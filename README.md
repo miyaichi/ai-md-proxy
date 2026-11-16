@@ -86,3 +86,58 @@ curl -H "x-api-key: <キー>" "https://<サービスURL>/md?url=<記事URL>"
 Workload Identity Federation（サービスアカウント鍵を使わない方式）で `miyaichi/ai-md-proxy` からのデプロイだけを許可し、
 リポジトリ変数 `GCP_PROJECT_ID` / `GCP_WIF_PROVIDER` / `GCP_DEPLOY_SA` を `gh` で登録します。
 以後は main ブランチへの push でテスト → デプロイが動きます（変数が未設定のあいだはテストだけ実行）。
+
+## To-Do：前段 Web サーバー／CDN で AI クローラーだけを振り分ける運用
+
+想定構成：パブリッシャーの Web サーバー（または CDN エッジ）が User-Agent を判定し、AI クローラーのときだけこのプロキシの Markdown を返す。それ以外（一般ユーザー、Googlebot、Bingbot 等）には従来どおり元の HTML を返す。
+
+### 1. キャッシュの分離（`Vary`）
+- [ ] 前段の Web サーバーや CDN から AI クローラーへレスポンスを返す際、必ず `Vary: User-Agent` を付与し、一般ユーザー用の HTML キャッシュと混ざらないようにする
+- [ ] **HTML 側のレスポンスにも同じ `Vary` を付ける**（片方だけだと、HTML のキャッシュが AI クローラーに、Markdown のキャッシュが人間に返る事故が起きうる）
+- [ ] `Vary: User-Agent` は UA 文字列の種類ごとにキャッシュが分かれ、ヒット率が大きく下がる。エッジで UA を「ai／other」に分類した値（例：`X-Client-Class`）をキャッシュキーに含める方式を検討する
+- [ ] `Accept: text/markdown` での出し分け（コンテントネゴシエーション）も行う場合は `Vary: Accept` も付ける
+
+### 2. 対象 User-Agent の限定
+- [ ] 対象は AI 事業者のクローラーに限定し、通常の `Googlebot` や `Bingbot` には元の HTML を返すようにルーティングする
+- [ ] 対象 UA の一覧は設定ファイル化し、コードを変えずに追加・削除できるようにする。初期候補：
+
+| 事業者 | User-Agent（HTTP リクエストに現れる名前） | 用途 |
+|---|---|---|
+| OpenAI | `GPTBot` / `OAI-SearchBot` / `ChatGPT-User` | 学習 / 検索インデックス / ユーザー操作による取得 |
+| Anthropic | `ClaudeBot` / `Claude-SearchBot` / `Claude-User` | 学習 / 検索インデックス / ユーザー操作による取得 |
+| Perplexity | `PerplexityBot` / `Perplexity-User` | 検索インデックス / ユーザー操作による取得 |
+
+- [ ] **`Google-Extended` は HTTP の User-Agent ではなく robots.txt 専用のトークン**。Google の AI 用途の取得も通常の Googlebot が行うため、UA では振り分けられない（Googlebot には HTML を返す方針のまま、AI 学習への利用可否は robots.txt の `Google-Extended` で制御する）。`Applebot-Extended` も同様に robots.txt 専用
+- [ ] 学習用（GPTBot、ClaudeBot）とユーザー操作による取得（ChatGPT-User、Claude-User、Perplexity-User）を区別して記録する。後者は「今まさに人間が質問している」取得なので、広告の価値・扱いが異なる
+
+### 3. UA 偽装への対策（追加提案）
+- [ ] UA だけを信用しない。各社が公開している IP レンジ（例：`openai.com/gptbot.json`、`openai.com/searchbot.json`、`openai.com/chatgpt-user.json`）や逆引き DNS で本物か確認し、確認できない場合は HTML を返す
+- [ ] CDN の検証済みボット機能（Cloudflare の Verified Bots／Web Bot Auth など）が使える場合はそれを優先する
+
+### 4. 検索エンジンとクローキング（追加提案）
+- [ ] Googlebot・Bingbot には必ず HTML を返す（検索順位への影響とクローキング判定を避ける）
+- [ ] Markdown 版の本文は HTML 版と同じ内容に保つ（広告・ナビゲーションの除去以外で内容を変えない）
+- [ ] Markdown 応答には `Link: <元記事URL>; rel="canonical"` を付け、元記事を正規 URL として伝える（実装済み）
+
+### 5. プロキシとの接続（追加提案）
+- [ ] 前段サーバー → プロキシの呼び出しには API キー（`x-api-key`）を使い、パブリッシャーごとに発行する。キーはサーバー設定に置き、外部に出さない
+- [ ] **ループ防止**：プロキシが元記事を取得するリクエストが、前段で AI クローラー扱いされて再びプロキシに回らないようにする（プロキシ用の識別ヘッダーや送信元 IP の許可リストで除外）。オリジン側のボット対策（WAF）にプロキシが遮断されないよう許可も設定する
+- [ ] **フェイルオープン**：プロキシがタイムアウト（目安 3〜5 秒）やエラーのときは元の HTML を返す
+- [ ] 404・410・リダイレクトは元記事のステータスをそのまま返す
+- [ ] 前段が既に持っている HTML をプロキシに渡す方式（POST で HTML を受け取る API）を追加し、オリジンへの二重取得をなくす
+
+### 6. キャッシュと性能（追加提案）
+- [ ] 記事更新時にプロキシ側と CDN 側の Markdown キャッシュを破棄する仕組み（現状はインスタンス内メモリで10分）
+- [ ] 本番では Cloud Run の最小インスタンスを 1 以上にしてコールドスタートを避ける
+- [ ] 共有キャッシュ（Memorystore や CDN）への移行
+
+### 7. 広告と計測（追加提案）
+- [ ] `<!-- ad-slot:N -->` を実際の Markdown 広告に置き換える処理
+- [ ] Markdown 広告には「広告」「PR」の表示を必ず付ける（AI の回答に引用された場合も広告だと分かるように）
+- [ ] クローラー種別・記事・広告枠ごとの配信ログと集計（パブリッシャーへのレポート用）
+- [ ] パブリッシャーの robots.txt の方針（どの AI クローラーを許可するか）と振り分け設定を一致させる
+
+参考：
+[Google の一般的なクローラー一覧](https://developers.google.com/crawling/docs/crawlers-fetchers/google-common-crawlers) /
+[OpenAI のクローラー](https://developers.openai.com/api/docs/bots) /
+[Anthropic のクローラー](https://support.claude.com/en/articles/8896518)
