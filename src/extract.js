@@ -5,6 +5,7 @@ import { gfm } from 'turndown-plugin-gfm';
 import dns from 'node:dns/promises';
 import net from 'node:net';
 import { removeAds } from './adfilter.js';
+import { findContentRoot, removeBoilerplate, contentParagraphs, textLen, cleanTitle } from './scope.js';
 
 const MAX_BYTES = 5 * 1024 * 1024; // 5MB
 const TIMEOUT_MS = 15000;
@@ -124,37 +125,61 @@ export function htmlToMarkdown(html, url, opts = {}) {
 
   // canonical / meta は除去前に拾っておく
   const meta = (sel) => doc.querySelector(sel)?.getAttribute('content') || undefined;
-  const canonical = doc.querySelector('link[rel="canonical"]')?.href || url;
+  const canonical = pickCanonical(doc, url);
+  const timeEl = doc.querySelector('article time, time[datetime]');
   const published =
     meta('meta[property="article:published_time"]') || meta('meta[name="pubdate"]') ||
-    doc.querySelector('time[datetime]')?.getAttribute('datetime');
+    timeEl?.getAttribute('datetime') || timeEl?.textContent.replace(/[\[\]\s]/g, '') || undefined;
   const lang = doc.documentElement.getAttribute('lang') || undefined;
+  const ogTitle = meta('meta[property="og:title"]');
+  const ogSite = meta('meta[property="og:site_name"]');
 
   const adStats = removeAds(doc);
 
-  const article = new Readability(doc, { charThreshold: 200, keepClasses: false }).parse();
-  if (!article || !article.content) throw new Error('本文を抽出できませんでした');
+  // 1) 本文の範囲を特定し、その範囲だけで処理する
+  let contentHtml;
+  let article;
+  let mode = 'readability';
+  const root = findContentRoot(doc);
+  if (root) {
+    const scoped = new JSDOM('<!DOCTYPE html><html><head></head><body></body></html>', { url, virtualConsole }).window.document;
+    scoped.head.innerHTML = doc.head.innerHTML;
+    scoped.body.appendChild(scoped.importNode(root, true));
+    removeBoilerplate(scoped.body);
+    const expected = contentParagraphs(scoped.body).reduce((s, p) => s + textLen(p), 0) || textLen(scoped.body) * 0.5;
+    const direct = scoped.body.innerHTML;
+    article = new Readability(scoped, { charThreshold: 100, keepClasses: false }).parse();
+    const got = article ? textLen(new JSDOM(article.content).window.document.body) : 0;
+    // Readability が本文の大半を残せていればその結果、落としていれば範囲をそのまま使う
+    if (article && got >= expected * 0.7) { contentHtml = article.content; mode = 'scoped+readability'; }
+    else { contentHtml = direct; mode = 'scoped'; }
+  }
+  // 2) 範囲が特定できなければ従来どおりページ全体を Readability に渡す
+  if (!contentHtml) {
+    article = new Readability(doc, { charThreshold: 200, keepClasses: false }).parse();
+    if (!article || !article.content) throw new Error('本文を抽出できませんでした');
+    contentHtml = article.content;
+  }
 
-  // タイトルから「 | サイト名」等の接尾辞を除去
-  const title = cleanTitle(article.title, article.siteName);
+  const site = article?.siteName || ogSite;
+  const title = cleanTitle(ogTitle || article?.title || doc.title, site);
 
-  let body = makeTurndown().turndown(article.content);
+  let body = makeTurndown().turndown(contentHtml);
   body = body.replace(/\n{3,}/g, '\n\n').trim();
   // 本文先頭の見出しがタイトルと同じなら重複させない
-  const firstHeading = /^#{1,3} (.+)\n/.exec(body);
-  const hasTitleHeading = firstHeading && title && firstHeading[1].trim() === title;
-  if (hasTitleHeading) body = body.replace(/^#{1,3} .+\n+/, '');
+  const norm = (s) => s.replace(/[\s　]/g, '');
+  body = body.replace(/^#{1,3} (.+)\n+/, (m, h) => (title && norm(h) === norm(title) ? '' : m));
 
   if (opts.adSlots > 0) body = insertAdSlotMarkers(body, opts.adSlots);
 
   const fm = frontMatter({
     title,
     source: canonical,
-    site: article.siteName,
-    byline: article.byline,
+    site,
+    byline: article?.byline,
     published,
     lang,
-    excerpt: article.excerpt,
+    excerpt: article?.excerpt || meta('meta[name="description"]'),
     fetched_at: new Date().toISOString(),
     removed_ad_elements: adStats.total,
   });
@@ -162,18 +187,25 @@ export function htmlToMarkdown(html, url, opts = {}) {
   const heading = title ? `# ${title}\n\n` : '';
   return {
     markdown: fm + heading + body + '\n',
-    meta: { title, canonical, adStats, length: article.length },
+    meta: { title, canonical, adStats, mode, length: body.length },
   };
 }
 
-function cleanTitle(t, site) {
-  if (!t) return t;
-  const parts = t.split(/\s+[|｜\-–—:：]\s+/);
-  if (parts.length > 1) {
-    const last = parts[parts.length - 1];
-    if (!site || last.includes(site) || site.includes(last) || last.length < 20) return parts.slice(0, -1).join(' | ');
+// 正規URLの決定: <link rel=canonical> → og:url → 取得URL
+// http(s) の絶対URLだけを採用し、URL オブジェクトで正規化（ヘッダーに載せても安全な形にする）
+function pickCanonical(doc, fallback) {
+  const cands = [
+    doc.querySelector('link[rel~="canonical"]')?.getAttribute('href'),
+    doc.querySelector('meta[property="og:url"]')?.getAttribute('content'),
+  ];
+  for (const c of cands) {
+    if (!c) continue;
+    try {
+      const u = new URL(c.trim(), fallback);
+      if (u.protocol === 'http:' || u.protocol === 'https:') { u.hash = ''; return u.href; }
+    } catch { /* 不正なURLは無視 */ }
   }
-  return t;
+  return fallback;
 }
 
 // 将来の「Markdown広告挿入」用：段落の区切りにマーカーを挿入

@@ -12,6 +12,14 @@ const onCloudRun = !!process.env.K_SERVICE;
 const authRequired = keys.size > 0 || onCloudRun;
 const allow = makeRateLimiter(Number(process.env.RATE_LIMIT_PER_MIN || 60));
 
+// Markdown 応答の共通ヘッダー
+// Link: rel="canonical" で、この Markdown が元記事（HTML）の別表現であることをHTTPレベルで伝える
+function mdHeaders(canonical) {
+  const h = { 'content-type': 'text/markdown; charset=utf-8' };
+  if (canonical) h.link = `<${canonical}>; rel="canonical"`;
+  return h;
+}
+
 const send = (res, status, body, headers = {}) =>
   res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8', ...headers }).end(body);
 
@@ -42,14 +50,14 @@ const server = http.createServer(async (req, res) => {
     const hit = cache.get(key);
     if (hit && Date.now() - hit.at < TTL_MS) {
       log(200, { cache: 'HIT' });
-      return send(res, 200, hit.body, { 'content-type': 'text/markdown; charset=utf-8', 'x-cache': 'HIT' });
+      return send(res, 200, hit.body, { ...mdHeaders(hit.canonical), 'x-cache': 'HIT' });
     }
     try {
       const { markdown, meta } = await urlToMarkdown(target, { adSlots: slots });
-      cache.set(key, { at: Date.now(), body: markdown });
-      log(200, { cache: 'MISS', removedAds: meta.adStats.total });
+      cache.set(key, { at: Date.now(), body: markdown, canonical: meta.canonical });
+      log(200, { cache: 'MISS', removedAds: meta.adStats.total, mode: meta.mode });
       return send(res, 200, markdown, {
-        'content-type': 'text/markdown; charset=utf-8',
+        ...mdHeaders(meta.canonical),
         'x-cache': 'MISS',
         'x-removed-ads': String(meta.adStats.total),
         'x-elapsed-ms': String(Date.now() - t0),

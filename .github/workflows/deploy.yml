@@ -28,6 +28,15 @@ jobs:
           grep -q "観光列車の導入" out.md
           ! grep -q "30%オフ" out.md
           ! grep -q "アクセスランキング" out.md
+      - name: ニュースポータル型のページで本文だけが残ることを確認
+        run: |
+          node src/cli.js --file test/fixture-portal.html --base https://sports.example.jp/sports/news/202611160000001.html > portal.md
+          cat portal.md
+          grep -q "最高齢の参加者は87歳" portal.md
+          grep -q "https://img.example.jp/photo/runners.jpg" portal.md
+          for w in メインコンテンツ RSS 通知ON 最新ニュース フィーチャー 写真ニュース ランキング すべての写真 次のページ 無断転載; do
+            if grep -q "$w" portal.md; then echo "残ってはいけない文字列: $w"; exit 1; fi
+          done
 
   deploy:
     needs: test
