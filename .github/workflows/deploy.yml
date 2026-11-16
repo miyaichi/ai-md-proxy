@@ -41,9 +41,10 @@ jobs:
           service_account: ${{ vars.GCP_DEPLOY_SA }}
       - uses: google-github-actions/setup-gcloud@v2
       - name: Deploy
-        # 公開/非公開の設定は初回デプロイ時のものを引き継ぐ
         run: |
           gcloud run deploy "$SERVICE" --source . \
             --project "${{ vars.GCP_PROJECT_ID }}" --region "$REGION" \
             --memory 1Gi --cpu 1 --concurrency 20 --timeout 60 \
-            --min-instances 0 --max-instances 3 --quiet
+            --min-instances 0 --max-instances 3 \
+            --set-secrets API_KEYS=ai-md-proxy-api-keys:latest \
+            --no-invoker-iam-check --quiet

@@ -51,22 +51,38 @@ curl "http://localhost:8787/md?url=https://example.com/article&slots=3"
 
 ## Cloud Run へのデプロイ（GCP プロジェクト: ai-md-proxy）
 
-### 1. 初回デプロイ（Mac から）
+### 1. デプロイ（Mac から）
 ```bash
-./scripts/deploy.sh                  # 請求先の紐付け・API有効化・デプロイ（認証必須）
-ALLOW_PUBLIC=1 ./scripts/deploy.sh   # 公開でデプロイする場合
+./scripts/deploy.sh
 ```
+請求先の紐付け、API有効化、APIキー用シークレットの作成、デプロイまでを行います。初回は管理者用キー（owner）が表示されます。
 東京リージョン、1 vCPU／1GiB、0〜3インスタンス。ビルドは Cloud Build が行うので Docker は不要です。
 
-### 2. GitHub Actions による自動デプロイ（一度だけ設定）
+### 2. APIキーの発行（社外チームとの共有）
+```bash
+./scripts/manage-keys.sh add partner-a     # キーを発行して表示 → 相手に渡す
+./scripts/manage-keys.sh list              # 発行済み一覧（キーは一部のみ表示）
+./scripts/manage-keys.sh show partner-a    # キーを再表示
+./scripts/manage-keys.sh rotate partner-a  # キーを作り直す（旧キーは即無効）
+./scripts/manage-keys.sh revoke partner-a  # 無効化
+```
+キーは Secret Manager（`ai-md-proxy-api-keys`）に保存され、変更すると Cloud Run の新リビジョンで自動的に反映されます（1分程度）。
+
+### 3. 呼び出し方（相手チームに伝える内容）
+```bash
+curl -H "x-api-key: <キー>" "https://<サービスURL>/md?url=<記事URL>"
+```
+ブラウザからは `https://<サービスURL>/md?url=<記事URL>&key=<キー>` でも呼べます。
+ただし URL に含めたキーはアクセスログに残るので、継続利用はヘッダー方式を推奨します。
+
+- キーごとに 1分あたり60回まで（環境変数 `RATE_LIMIT_PER_MIN` で変更可）。超えると 429
+- アクセスログはキーの名前付きで Cloud Logging に出ます（`jsonPayload.client="partner-a"` で絞り込み）
+- ローカル実行（`npm start`）で `API_KEYS` を設定しなければ認証なしで動きます
+
+### 4. GitHub Actions による自動デプロイ（一度だけ設定）
 ```bash
 ./scripts/setup-github-actions.sh
 ```
 Workload Identity Federation（サービスアカウント鍵を使わない方式）で `miyaichi/ai-md-proxy` からのデプロイだけを許可し、
 リポジトリ変数 `GCP_PROJECT_ID` / `GCP_WIF_PROVIDER` / `GCP_DEPLOY_SA` を `gh` で登録します。
 以後は main ブランチへの push でテスト → デプロイが動きます（変数が未設定のあいだはテストだけ実行）。
-
-### 非公開時の呼び出し
-```bash
-curl -H "Authorization: Bearer $(gcloud auth print-identity-token)" "https://<サービスURL>/md?url=<記事URL>"
-```
